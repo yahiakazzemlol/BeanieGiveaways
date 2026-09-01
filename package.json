@@ -1,0 +1,16 @@
+{
+  "name": "discord-giveaway-bot",
+  "version": "1.0.0",
+  "description": "A Discord giveaway bot with slash commands and DM winner notifications.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.14.1",
+    "dotenv": "^16.4.5"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
