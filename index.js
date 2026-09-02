@@ -48,28 +48,67 @@ const commands = [
 
 // ---------- Register slash commands on startup ----------
 async function registerCommands() {
-  const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
-  await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
-  console.log("Slash commands registered.");
+  try {
+    const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
+    await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
+    console.log("[startup] Slash commands registered successfully.");
+  } catch (err) {
+    console.error("[startup] FAILED to register slash commands:", err);
+  }
 }
 
 client.once("ready", async () => {
-  console.log(`Logged in as ${client.user.tag}`);
+  console.log(`[startup] Logged in as ${client.user.tag}`);
   await registerCommands();
+});
+
+// Catch errors explicitly instead of failing silently
+client.on("error", (err) => {
+  console.error("[client error]", err);
+});
+process.on("unhandledRejection", (err) => {
+  console.error("[unhandled rejection]", err);
 });
 
 // ---------- Handle slash command + button interactions ----------
 client.on("interactionCreate", async (interaction) => {
-  if (interaction.isChatInputCommand()) {
-    if (interaction.commandName === "start" && interaction.options.getSubcommand() === "giveaway") {
-      await handleStartGiveaway(interaction);
+  console.log(
+    `[interaction] type=${interaction.type} name=${interaction.commandName ?? interaction.customId} user=${interaction.user?.tag}`
+  );
+
+  try {
+    if (interaction.isChatInputCommand()) {
+      if (interaction.commandName === "start" && interaction.options.getSubcommand() === "giveaway") {
+        await handleStartGiveaway(interaction);
+      }
+    } else if (interaction.isButton()) {
+      if (interaction.customId.startsWith("join_giveaway_")) {
+        await handleJoinButton(interaction);
+      }
     }
-  } else if (interaction.isButton()) {
-    if (interaction.customId.startsWith("join_giveaway_")) {
-      await handleJoinButton(interaction);
+  } catch (err) {
+    console.error("[interaction error]", err);
+    if (interaction.isRepliable() && !interaction.replied && !interaction.deferred) {
+      await interaction
+        .reply({ content: "Something went wrong running that command. Check the bot logs.", ephemeral: true })
+        .catch(() => {});
     }
   }
 });
+
+function buildGiveawayEmbed({ number, prize, winnersCount, hostId, endTimestamp, entryCount }) {
+  return new EmbedBuilder()
+    .setTitle(`🎉 Giveaway #${number} Started!`)
+    .setDescription(
+      `**Prize:** ${prize}\n` +
+        `**Winners:** ${winnersCount}\n` +
+        `**Entries:** ${entryCount}\n` +
+        `**Hosted by:** <@${hostId}>\n` +
+        `**Ends:** <t:${endTimestamp}:R>\n\n` +
+        `Click the button below to enter!`
+    )
+    .setColor(0x5865f2);
+}
 
 async function handleStartGiveaway(interaction) {
   const number = interaction.options.getInteger("number");
@@ -85,17 +124,9 @@ async function handleStartGiveaway(interaction) {
   }
 
   const endTimestamp = Math.floor(Date.now() / 1000) + duration * 60;
+  const hostId = interaction.user.id;
 
-  const embed = new EmbedBuilder()
-    .setTitle(`🎉 Giveaway #${number} Started!`)
-    .setDescription(
-      `**Prize:** ${prize}\n` +
-        `**Winners:** ${winnersCount}\n` +
-        `**Hosted by:** <@${interaction.user.id}>\n` +
-        `**Ends:** <t:${endTimestamp}:R>\n\n` +
-        `Click the button below to enter!`
-    )
-    .setColor(0x5865f2);
+  const embed = buildGiveawayEmbed({ number, prize, winnersCount, hostId, endTimestamp, entryCount: 0 });
 
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
@@ -108,8 +139,11 @@ async function handleStartGiveaway(interaction) {
   const message = await interaction.fetchReply();
 
   activeGiveaways.set(message.id, {
+    number,
     prize,
     winnersCount,
+    hostId,
+    endTimestamp,
     entrants: new Set(),
     channelId: interaction.channelId,
     guildName: interaction.guild.name,
@@ -134,6 +168,19 @@ async function handleJoinButton(interaction) {
       ephemeral: true,
     });
   }
+
+  // Update the entry count shown on the giveaway embed
+  const updatedEmbed = buildGiveawayEmbed({
+    number: giveaway.number,
+    prize: giveaway.prize,
+    winnersCount: giveaway.winnersCount,
+    hostId: giveaway.hostId,
+    endTimestamp: giveaway.endTimestamp,
+    entryCount: giveaway.entrants.size,
+  });
+  await interaction.message.edit({ embeds: [updatedEmbed] }).catch((err) => {
+    console.error("[entry count update failed]", err);
+  });
 }
 
 async function endGiveaway(message) {
@@ -144,7 +191,6 @@ async function endGiveaway(message) {
   const channel = await client.channels.fetch(giveaway.channelId);
   const entrants = Array.from(giveaway.entrants);
 
-  // Disable the button
   try {
     const disabledRow = new ActionRowBuilder().addComponents(
       ButtonBuilder.from(message.components[0].components[0]).setDisabled(true)
@@ -157,7 +203,7 @@ async function endGiveaway(message) {
   if (entrants.length === 0) {
     const noWinnerEmbed = new EmbedBuilder()
       .setTitle("🎉 Giveaway Ended")
-      .setDescription(`**Prize:** ${giveaway.prize}\nNo one entered — no winner this time.`)
+      .setDescription(`**Prize:** ${giveaway.prize}\n**Entries:** 0\nNo one entered — no winner this time.`)
       .setColor(0xed4245);
     return channel.send({ embeds: [noWinnerEmbed] });
   }
@@ -169,11 +215,12 @@ async function endGiveaway(message) {
 
   const resultEmbed = new EmbedBuilder()
     .setTitle("🎉 Giveaway Ended!")
-    .setDescription(`**Prize:** ${giveaway.prize}\n**Winner(s):** ${mentions}\n\nCongratulations!`)
+    .setDescription(
+      `**Prize:** ${giveaway.prize}\n**Entries:** ${entrants.length}\n**Winner(s):** ${mentions}\n\nCongratulations!`
+    )
     .setColor(0xf1c40f);
   await channel.send({ embeds: [resultEmbed] });
 
-  // DM each winner
   for (const id of winnerIds) {
     try {
       const user = await client.users.fetch(id);
@@ -188,4 +235,6 @@ async function endGiveaway(message) {
   }
 }
 
-client.login(process.env.DISCORD_TOKEN);
+client.login(process.env.DISCORD_TOKEN).catch((err) => {
+  console.error("[startup] FAILED to log in:", err);
+});
